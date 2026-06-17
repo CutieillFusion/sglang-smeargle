@@ -805,6 +805,11 @@ class ModelConfig:
         self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
+        if "Mamba2LlamaSmeargleForCausalLM" in self.hf_config.architectures:
+            # The SMEARGLE draft's single decoder layer is a Mamba2 SSM block,
+            # not attention; it owns its SSM cache in the speculative worker and
+            # writes no attention KV, so size its attention KV pool to zero.
+            self.num_attention_layers = 0
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
             self.num_attention_layers = self.num_hidden_layers * 2
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:

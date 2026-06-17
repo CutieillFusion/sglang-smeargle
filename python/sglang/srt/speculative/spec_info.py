@@ -332,3 +332,10 @@ def create_dummy_verify_input(
         spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
     return spec_info
+
+
+# Register bundled plugin speculative algorithms as an import side effect. This
+# runs in every process that imports SpeculativeAlgorithm (main, scheduler, and
+# worker subprocesses), so ``from_string("SMEARGLE")`` resolves everywhere.
+# Placed at the bottom so SpeculativeAlgorithm is fully defined first.
+import sglang.srt.speculative.smeargle_registration  # noqa: E402,F401
