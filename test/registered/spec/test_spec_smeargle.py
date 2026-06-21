@@ -46,6 +46,11 @@ def _generate(base_url, prompt, max_new_tokens=48):
 
 
 class TestSmeargleSpeculativeDecoding(CustomTestCase):
+    # topk == 1 -> chain; topk > 1 -> beam-search draft tree (see subclass).
+    eagle_topk = 1
+    num_steps = 5
+    num_draft_tokens = 6
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = "http://127.0.0.1:30020"
@@ -61,7 +66,11 @@ class TestSmeargleSpeculativeDecoding(CustomTestCase):
                 "--speculative-draft-model-path",
                 DRAFT_MODEL,
                 "--speculative-num-steps",
-                "5",
+                str(cls.num_steps),
+                "--speculative-eagle-topk",
+                str(cls.eagle_topk),
+                "--speculative-num-draft-tokens",
+                str(cls.num_draft_tokens),
                 "--disable-overlap-schedule",
                 "--attention-backend",
                 "triton",
@@ -97,6 +106,16 @@ class TestSmeargleSpeculativeDecoding(CustomTestCase):
         self.assertGreater(
             avg_accept, 1.0, msg=f"no speculative acceleration: {accept_lengths}"
         )
+
+
+class TestSmeargleTreeSpeculativeDecoding(TestSmeargleSpeculativeDecoding):
+    """Tree mode (topk > 1): beam-search draft over the Mamba SSM state. Reuses
+    the lossless + acceleration checks; tree drafting must also be lossless under
+    greedy and should accept more than the chain."""
+
+    eagle_topk = 4
+    num_steps = 5
+    num_draft_tokens = 8
 
 
 if __name__ == "__main__":

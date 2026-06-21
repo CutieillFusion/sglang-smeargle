@@ -372,6 +372,17 @@ class Mamba2LlamaSmeargleForCausalLM(nn.Module):
         values, indices = torch.topk(log_probs, k, dim=-1)
         return values, self._draft_to_target(indices)
 
+    def compute_target_topk_probs(
+        self, hidden_states: torch.Tensor, k: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Top-k by softmax PROBABILITY: returns ``(top_probs, top_target_ids)``,
+        both ``(N, k)``. Used by the tree beam search, which scores branches by
+        cumulative probability product (matching EAGLE's ``select_top_k_tokens``),
+        not log-prob sum."""
+        probs = torch.softmax(self._draft_logits(hidden_states).float(), dim=-1)
+        values, indices = torch.topk(probs, k, dim=-1)
+        return values, self._draft_to_target(indices)
+
     def get_hot_token_id(self):
         return self.hot_token_id
 

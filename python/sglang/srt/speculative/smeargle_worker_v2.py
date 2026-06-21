@@ -36,7 +36,11 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import AdaptiveController
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
+    organize_draft_results,
+)
 from sglang.srt.speculative.eagle_worker_v2 import (
     EagleDraftWorker,
     EAGLEWorkerV2,
@@ -45,6 +49,7 @@ from sglang.srt.speculative.eagle_worker_v2 import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import empty_context
+from sglang.srt.utils.common import fast_topk
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +96,125 @@ def run_mamba_chain(
         token = model.compute_target_argmax(hidden)  # [bs] target-vocab ids
         drafts.append(token)
     return torch.stack(drafts, dim=1)  # [bs, num_steps]
+
+
+# ---------------------------------------------------------------------------
+# Tree drafting (beam search over the Mamba2 SSM state).
+#
+# Mirrors the SMEARGLE standalone `topK_genrate` and vLLM's `_propose_tree_dynamic`:
+# per-depth beam expansion (width = topk, depth = num_steps), forking/reindexing the
+# Mamba2 cache by the surviving parents. The per-step bookkeeping reproduces SGLang
+# EAGLE's `_select_top_k_tokens_{first,later}` exactly, so the resulting
+# (score_list, token_list, parents_list) feed `organize_draft_results` /
+# `build_tree_kernel_efficient` unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _expand_mamba_cache(cache, n: int):
+    """Repeat each batch row n times (bs -> bs*n), so each of the n beams forked
+    from a parent starts from the parent's SSM state. Mirrors the reference's
+    ``expand_mamba_cache`` (the SGLang DynamicCache stores batch dim 0)."""
+    layer = cache.layers[0]
+    layer.conv_states = layer.conv_states.repeat_interleave(n, dim=0).contiguous()
+    layer.recurrent_states = layer.recurrent_states.repeat_interleave(
+        n, dim=0
+    ).contiguous()
+    return cache
+
+
+def _reindex_mamba_cache(cache, index: torch.Tensor):
+    """Permute the batch dim by ``index`` (one entry per surviving beam), so each
+    survivor inherits its parent's SSM state. Mirrors ``reindex_mamba_cache``."""
+    layer = cache.layers[0]
+    layer.conv_states = layer.conv_states[index].contiguous()
+    layer.recurrent_states = layer.recurrent_states[index].contiguous()
+    return cache
+
+
+def _beam_step(i, topk_p, topk_index, hidden, scores, topk):
+    """One beam-expansion step. Reproduces ``_select_top_k_tokens_{first,later}``
+    (so the emitted tree_info is byte-compatible with ``organize_draft_results``),
+    and additionally returns ``cache_index`` — the parent row each surviving beam
+    came from — to reindex the Mamba cache. ``cache_index`` is None at i==0 (the
+    caller expand-forks the cache instead)."""
+    if i == 0:
+        bs = topk_p.shape[0]
+        input_ids = topk_index.flatten()  # [bs*topk]
+        hidden = hidden.repeat_interleave(topk, dim=0)  # [bs*topk, H]
+        tree_info = (
+            topk_p.unsqueeze(1),  # [bs, 1, topk]
+            topk_index,  # [bs, topk]
+            torch.arange(
+                -1, topk, dtype=torch.long, device=input_ids.device
+            ).expand(bs, -1),  # [bs, topk+1]
+        )
+        return input_ids, hidden, topk_p, tree_info, None
+
+    topk_sq = topk * topk
+    expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)  # [bs,topk,topk]
+    topk_cs_p, topk_cs_index = fast_topk(
+        expand_scores.flatten(start_dim=1), topk, dim=-1
+    )  # [bs, topk]
+    topk_index = topk_index.view(-1, topk_sq)  # [bs, topk*topk]
+    input_ids = torch.gather(topk_index, 1, topk_cs_index).flatten()  # [bs*topk]
+
+    flat_cs = topk_cs_index.flatten()
+    batch_offsets = torch.arange(0, hidden.shape[0], step=topk, device=flat_cs.device)
+    cache_index = flat_cs // topk + batch_offsets.repeat_interleave(topk)  # [bs*topk]
+    hidden = hidden[cache_index]
+
+    tree_info = (
+        expand_scores,  # [bs, topk, topk]
+        topk_index,  # [bs, topk*topk]
+        topk_cs_index + (topk_sq * (i - 1) + topk),  # [bs, topk]
+    )
+    return input_ids, hidden, topk_cs_p, tree_info, cache_index
+
+
+def run_mamba_tree(model, fused_hidden, seed_tokens, topk: int, num_steps: int):
+    """Beam-search draft tree. Returns (score_list, token_list, parents_list) in the
+    format ``organize_draft_results`` expects."""
+    from transformers.cache_utils import DynamicCache
+
+    cache = DynamicCache(config=model.model.midlayer._hf_mamba2_config)
+
+    # Root forward (the bonus token): advances the cache to the root state and
+    # predicts the root's top-k children.
+    hidden = model.forward(
+        input_ids=None,
+        positions=None,
+        hidden_states=fused_hidden,
+        input_embeds=model.embed_input_ids(seed_tokens),
+        cache_params=cache,
+    )  # [bs, H]
+    topk_p, topk_index = model.compute_target_topk_probs(hidden, topk)
+
+    score_list, token_list, parents_list = [], [], []
+    scores = None
+    for i in range(num_steps):
+        input_ids, hidden, scores, tree_info, cache_index = _beam_step(
+            i, topk_p, topk_index, hidden, scores, topk
+        )
+        score_list.append(tree_info[0])
+        token_list.append(tree_info[1])
+        parents_list.append(tree_info[2])
+        if i == num_steps - 1:
+            break
+        # Fork/reindex the SSM state to match the selected beams, then advance.
+        if i == 0:
+            cache = _expand_mamba_cache(cache, topk)  # bs -> bs*topk
+        else:
+            cache = _reindex_mamba_cache(cache, cache_index)  # survivors' parents
+        hidden = model.forward(
+            input_ids=None,
+            positions=None,
+            hidden_states=hidden,
+            input_embeds=model.embed_input_ids(input_ids),
+            cache_params=cache,
+        )  # [bs*topk, H]
+        topk_p, topk_index = model.compute_target_topk_probs(hidden, topk)
+
+    return score_list, token_list, parents_list
 
 
 class SmeargleDraftGraphRunner:
@@ -277,19 +401,29 @@ class SmeargleDraftWorker(EagleDraftWorker):
         fused = model.combine_hidden_states(draft_input.hidden_states)
         seed_tokens = draft_input.bonus_tokens.to(torch.int64).view(-1)
 
-        draft_tokens = None
-        runner = getattr(self, "_draft_graph_runner", None)
-        if runner is not None:
-            draft_tokens = runner.run(fused, seed_tokens)
-        if draft_tokens is None:
-            draft_tokens = run_mamba_chain(
-                model, fused, seed_tokens, self.speculative_num_steps
+        if self.topk == 1:
+            # Chain: a single greedy path of num_steps tokens.
+            draft_tokens = None
+            runner = getattr(self, "_draft_graph_runner", None)
+            if runner is not None:
+                draft_tokens = runner.run(fused, seed_tokens)
+            if draft_tokens is None:
+                draft_tokens = run_mamba_chain(
+                    model, fused, seed_tokens, self.speculative_num_steps
+                )
+            # Degenerate tree: parent_list / top_scores_index are runtime-invariant.
+            top_scores_index = self._topk1_score_indices_prealloc[:bs]
+            parent_list = self._topk1_parents_prealloc[:bs]
+        else:
+            # Tree: beam search (width=topk, depth=num_steps) over the Mamba SSM
+            # state, then prune to num_draft_tokens by cumulative score. Reuses
+            # EAGLE's organize_draft_results verbatim.
+            score_list, token_list, parents_list = run_mamba_tree(
+                model, fused, seed_tokens, self.topk, self.speculative_num_steps
             )
-
-        # Chain == topk==1 degenerate tree: parent_list / top_scores_index are
-        # the pre-allocated runtime-invariant constants.
-        top_scores_index = self._topk1_score_indices_prealloc[:bs]
-        parent_list = self._topk1_parents_prealloc[:bs]
+            parent_list, top_scores_index, draft_tokens = organize_draft_results(
+                score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            )
 
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()

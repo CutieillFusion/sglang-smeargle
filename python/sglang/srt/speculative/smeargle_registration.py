@@ -76,23 +76,30 @@ def _validate_server_args(server_args: "ServerArgs") -> None:
             "SMEARGLE speculative decoding requires --speculative-draft-model-path."
         )
 
-    # Chain mode == degenerate topk==1 tree.
-    if server_args.speculative_eagle_topk not in (None, 1):
-        logger.warning(
-            "SMEARGLE only supports chain mode (speculative_eagle_topk == 1); "
-            "overriding speculative_eagle_topk=%s to 1.",
-            server_args.speculative_eagle_topk,
-        )
-    server_args.speculative_eagle_topk = 1
-
+    # topk == 1 -> chain; topk > 1 -> beam-search draft tree. Default to the
+    # EAGLE3 Llama preset (num_steps=5, topk=4, num_draft_tokens=8) when unset.
+    if server_args.speculative_eagle_topk is None:
+        server_args.speculative_eagle_topk = 4
     if server_args.speculative_num_steps is None:
         server_args.speculative_num_steps = 5
-        logger.warning(
-            "speculative_num_steps is not set; defaulting to 5 for SMEARGLE."
-        )
+    topk = server_args.speculative_eagle_topk
+    num_steps = server_args.speculative_num_steps
 
-    # topk==1 invariant asserted by the worker's chain buffers.
-    server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
+    if topk == 1:
+        # Chain: the worker's topk==1 buffers require this invariant.
+        server_args.speculative_num_draft_tokens = num_steps + 1
+    else:
+        # Tree: prune the beam (topk*num_steps candidate nodes) to num_draft_tokens.
+        max_nodes = topk * num_steps + 1
+        if server_args.speculative_num_draft_tokens is None:
+            server_args.speculative_num_draft_tokens = min(8, max_nodes)
+        if not (2 <= server_args.speculative_num_draft_tokens <= max_nodes):
+            raise ValueError(
+                f"SMEARGLE tree mode requires 2 <= speculative_num_draft_tokens <= "
+                f"topk*num_steps+1 ({max_nodes}); got "
+                f"{server_args.speculative_num_draft_tokens} "
+                f"(topk={topk}, num_steps={num_steps})."
+            )
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
